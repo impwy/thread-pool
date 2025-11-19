@@ -9,7 +9,7 @@ class ThreadPoolTest {
 
     @Test
     void submittedTasksAreExecuted() throws Exception {
-        final ThreadPool executor = new ThreadPool(1, Duration.ofNanos(1));
+        final ThreadPool executor = new ThreadPool(3, 6, Duration.ofNanos(1));
         final int numTasks = 10000;
         final CountDownLatch latch = new CountDownLatch(numTasks);
         try {
@@ -34,7 +34,6 @@ class ThreadPoolTest {
                 });
             }
             latch.await();
-            System.err.println("-----------------");
             Thread.sleep(1000);
         } finally {
             executor.shutdown();
