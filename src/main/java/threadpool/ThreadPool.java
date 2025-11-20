@@ -1,14 +1,13 @@
 package threadpool;
 
-import java.time.Duration;
+import static com.google.common.base.Preconditions.checkState;
+
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.Executor;
-import java.util.concurrent.LinkedTransferQueue;
-import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -17,8 +16,19 @@ import java.util.concurrent.locks.ReentrantLock;
 
 import javax.annotation.Nullable;
 
-@SuppressWarnings("ALL")
-public class ThreadPool implements Executor {
+public final class ThreadPool implements Executor {
+
+    public static ThreadPool of(int maxNumWorkers) {
+        return builder(maxNumWorkers).build();
+    }
+
+    public static ThreadPool of(int minNumWorkers, int maxNumWorkers) {
+        return builder(maxNumWorkers).minNumWorkers(minNumWorkers).build();
+    }
+
+    public static ThreadPoolBuilder builder(int maxNumWorkers) {
+        return new ThreadPoolBuilder(maxNumWorkers);
+    }
 
     private static final Worker[] EMPTY_WORKERS_ARRAY = new Worker[0];
     public static final Runnable SHUTDOWN_TASK = () -> {};
@@ -26,30 +36,63 @@ public class ThreadPool implements Executor {
     private final int minNumWorkers;
     private final int maxNumWorkers;
     private final long idleTimeoutNanos;
-    private final BlockingQueue<Runnable> queue = new LinkedTransferQueue<>();
+    private final BlockingQueue<Runnable> queue;
+    private final TaskSubmissionHandler taskSubmissionHandler;
     private final AtomicBoolean shutdown = new AtomicBoolean();
     private final Set<Worker> workers = new HashSet<>();
     private final Lock workersLock = new ReentrantLock();
     private final AtomicInteger numWorkers = new AtomicInteger();
     private final AtomicInteger numBusyWorkers = new AtomicInteger();
 
-    public ThreadPool(int minNumWorkers, int maxNumWorkers, Duration idleTimeout) {
+    ThreadPool(int minNumWorkers, int maxNumWorkers, long idleTimeoutNanos,
+               BlockingQueue<Runnable> queue, TaskSubmissionHandler taskSubmissionHandler) {
         this.minNumWorkers = minNumWorkers;
         this.maxNumWorkers = maxNumWorkers;
-        idleTimeoutNanos = idleTimeout.toNanos();
+        this.idleTimeoutNanos = idleTimeoutNanos;
+        this.queue = queue;
+        this.taskSubmissionHandler = taskSubmissionHandler;
     }
 
     @Override
-    public void execute(Runnable command) {
-        if (shutdown.get()) {
-            throw new RejectedExecutionException();
+    public void execute(Runnable task) {
+        if (!handleLateSubmission(task)) {
+            return;
         }
-        queue.add(command);
+
+        if (!handleSubmission(task)) {
+            return;
+        }
+
         addWorkersIfNecessary();
         if (shutdown.get()) {
-            queue.remove(command);
-            throw new RejectedExecutionException();
+            //noinspection ResultOfMethodCallIgnored
+            queue.remove(task);
+            final boolean accepted = handleLateSubmission(task);
+            assert !accepted;
         }
+    }
+
+    private boolean handleSubmission(Runnable task) {
+        final TaskAction action = taskSubmissionHandler.handleSubmission(task, queue.size());
+        if (action == TaskAction.accept()) {
+            queue.add(task);
+            return true;
+        }
+
+        action.doAction(task);
+        return false;
+    }
+
+    private boolean handleLateSubmission(Runnable task) {
+        if (!shutdown.get()) {
+            return true;
+        }
+
+        final TaskAction action = taskSubmissionHandler.handleLateSubmission(task);
+        checkState(action != TaskAction.accept(),
+                   "TaskSubmissionHandler.handleLateSubmission() should never accept a task.");
+        action.doAction(task);
+        return false;
     }
 
     private void addWorkersIfNecessary() {
@@ -62,12 +105,12 @@ public class ThreadPool implements Executor {
                 // - shutting down a pool doesn't occur very often; and
                 // - it's now worth checking whether the pool is shut down or not frequently.
                 while (!shutdown.get()) {
-                    final WorkerType workerType = needsMoreWorker();
-                    if (workerType != null) {
+                    final ExpirationMode expirationMode = needsMoreWorker();
+                    if (expirationMode != null) {
                         if (newWorkers == null) {
                             newWorkers = new ArrayList<>();
                         }
-                        newWorkers.add(newWorker(workerType));
+                        newWorkers.add(newWorker(expirationMode));
                     } else {
                         break;
                     }
@@ -84,31 +127,31 @@ public class ThreadPool implements Executor {
     }
 
     /**
-     * Returns the type of the worker if more worker is needed to handle a newly submitted task.
-     * {@code null} is returned if no new worker is needed.
+     * Returns the {@link ExpirationMode} of the worker if more worker is needed to handle a newly submitted
+     * task. {@code null} is returned if no new worker is needed.
      */
     @Nullable
-    private WorkerType needsMoreWorker() {
+    private ExpirationMode needsMoreWorker() {
         final int numBusyWorkers = this.numBusyWorkers.get();
         final int numWorkers = this.numWorkers.get();
 
         if (numWorkers < minNumWorkers) {
-            return WorkerType.CORE;
+            return ExpirationMode.NEVER;
         }
 
         if (numBusyWorkers >= numWorkers) {
             if (numBusyWorkers < maxNumWorkers) {
-                return WorkerType.EXTRA;
+                return idleTimeoutNanos > 0 ? ExpirationMode.ON_IDLE : ExpirationMode.NEVER;
             }
         }
 
         return null;
     }
 
-    private Worker newWorker(WorkerType workerType) {
+    private Worker newWorker(ExpirationMode expirationMode) {
         numWorkers.incrementAndGet();
         numBusyWorkers.incrementAndGet();
-        final Worker worker = new Worker(workerType);
+        final Worker worker = new Worker(expirationMode);
         workers.add(worker);
         return worker;
     }
@@ -140,17 +183,24 @@ public class ThreadPool implements Executor {
         }
     }
 
-    private enum WorkerType {
-        CORE,
-        EXTRA
+    private enum ExpirationMode {
+        /**
+         * The worker that never gets terminated.
+         * It's only terminated by {@link #SHUTDOWN_TASK}, which is submitted when the pool is shut down.
+         */
+        NEVER,
+        /**
+         * The worker that can be terminated due to idle timeout.
+         */
+        ON_IDLE
     }
 
     private class Worker {
-        private final WorkerType type;
+        private final ExpirationMode expirationMode;
         private final Thread thread;
 
-        Worker(WorkerType type) {
-            this.type = type;
+        Worker(ExpirationMode expirationMode) {
+            this.expirationMode = expirationMode;
             thread = new Thread(this::work);
         }
 
@@ -184,11 +234,11 @@ public class ThreadPool implements Executor {
                                 System.err.println(Thread.currentThread().getName() + " idle");
                             }
 
-                            switch (type) {
-                                case CORE:
+                            switch (expirationMode) {
+                                case NEVER:
                                     task = queue.take();
                                     break;
-                                case EXTRA:
+                                case ON_IDLE:
                                     final long waitTimeNanos =
                                             idleTimeoutNanos - (System.nanoTime() - lastRunTimeNanos);
                                     if (waitTimeNanos <= 0 ||
@@ -253,7 +303,7 @@ public class ThreadPool implements Executor {
                     workersLock.unlock();
                 }
 
-                System.err.println("Shutting down thread '" + Thread.currentThread().getName() + "' (" + type + ')');
+                System.err.println("Shutting down thread '" + Thread.currentThread().getName() + "' (" + expirationMode + ')');
             }
         }
     }
